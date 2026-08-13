@@ -1,0 +1,85 @@
+# =========================================================
+# MangaShelf - Git Ignore
+# =========================================================
+
+# Miscellaneous
+*.class
+*.log
+*.pyc
+*.swp
+.DS_Store
+Thumbs.db
+.atom/
+.build/
+.buildlog/
+.history
+.svn/
+.swiftpm/
+migrate_working_dir/
+
+# IntelliJ / Android Studio
+*.iml
+*.ipr
+*.iws
+.idea/
+
+# VS Code
+# Mantemos configurações do VS Code permitidas por padrão.
+# .vscode/
+
+# Flutter / Dart / Pub
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.pub-cache/
+.pub/
+build/
+coverage/
+
+# Flutter Widget Preview
+.widget_preview/
+
+# Android build artifacts
+/android/app/debug
+/android/app/profile
+/android/app/release
+
+# Symbolication
+app.*.symbols
+
+# Obfuscation
+app.*.map.json
+
+# =========================================================
+# MangaShelf - arquivos pessoais / biblioteca local
+# =========================================================
+
+# Mangás não devem ser enviados ao GitHub
+*.epub
+*.cbz
+
+# Caso use ZIP como mangá
+*.zip
+
+# Bancos / armazenamento local
+*.db
+*.sqlite
+*.sqlite3
+
+# Arquivos de ambiente / segredos
+.env
+.env.*
+!.env.example
+
+# Chaves e certificados
+*.key
+*.pem
+*.p12
+*.jks
+*.keystore
+
+# Arquivos temporários
+*.tmp
+*.temp
