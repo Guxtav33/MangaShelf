@@ -8,6 +8,14 @@ O projeto nasceu da ideia de ter uma biblioteca pessoal semelhante aos antigos l
 
 ---
 
+## 📸 Capturas de tela
+
+| Windows | Android |
+|---|---|
+| ![Biblioteca no Windows](docs/screenshots/windows-biblioteca.png) | ![Biblioteca no Android](docs/screenshots/android-biblioteca.jpg) |
+
+---
+
 ## ✨ Funcionalidades
 
 - 📚 Biblioteca local de mangás
@@ -98,3 +106,4 @@ Verifique a instalação:
 
 ```bash
 flutter doctor
+```
