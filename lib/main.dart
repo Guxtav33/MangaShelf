@@ -1,21 +1,55 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:hive_ce_flutter/hive_flutter.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
+import 'package:window_manager/window_manager.dart';
+
+import 'platform_file_loader.dart';
 
 const String libraryBoxName = 'mangashelf_library';
+const String metadataBoxName = 'mangashelf_metadata';
+const MethodChannel androidFileChannel =
+    MethodChannel('mangashelf/file_open');
+
+String progressKey(String mangaId) =>
+    '__progress__$mangaId';
+
+String metadataKey(String mangaId) =>
+    '__meta__$mangaId';
+
+const String androidLastOpenedPathKey =
+    '__android_last_opened_path';
+
+// Pasta padrão para capas personalizadas no Windows.
+// Exemplos:
+// D:\IMAGENS\Capas de manga\One Piece capa.webp
+// D:\IMAGENS\Capas de manga\Blue Lock capa.jpg
+//
+// Se nenhuma capa externa existir, o MangaShelf usa
+// automaticamente a capa interna do mangá.
+const String windowsSeriesCoverFolder =
+    r'D:\IMAGENS\Capas de manga';
+
+final Map<String, Future<Uint8List?>>
+    _customSeriesCoverCache = {};
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await Hive.initFlutter();
-  await Hive.openBox(libraryBoxName);
+  if (!kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.windows) {
+    await windowManager.ensureInitialized();
+  }
 
+  // Mostra a interface imediatamente. O armazenamento é aberto
+  // depois do primeiro frame para não segurar a splash nativa.
   runApp(const MangaShelfApp());
 }
 
@@ -114,8 +148,10 @@ class MangaItem {
   final String fileName;
   final String author;
   final String format;
+  final String seriesOverride;
   final Uint8List coverBytes;
   final List<MangaPage> pages;
+  final int storedPageCount;
 
   int lastPage;
 
@@ -126,9 +162,15 @@ class MangaItem {
     required this.pages,
     this.author = '',
     this.format = 'CBZ',
+    this.seriesOverride = '',
     Uint8List? coverBytes,
+    int? pageCount,
     this.lastPage = -1,
-  }) : coverBytes = coverBytes ?? Uint8List(0);
+  })  : storedPageCount = pageCount ?? pages.length,
+        coverBytes = coverBytes ?? Uint8List(0);
+
+  int get pageCount =>
+      pages.isNotEmpty ? pages.length : storedPageCount;
 
   Uint8List get cover {
     if (coverBytes.isNotEmpty) {
@@ -145,14 +187,43 @@ class MangaItem {
   bool get hasStarted => lastPage >= 0;
 
   bool get isFinished =>
-      pages.isNotEmpty && lastPage >= pages.length - 1;
+      pageCount > 0 && lastPage >= pageCount - 1;
 
   double get progress {
-    if (!hasStarted || pages.isEmpty) {
+    if (!hasStarted || pageCount <= 0) {
       return 0;
     }
 
-    return (lastPage + 1) / pages.length;
+    return (lastPage + 1) / pageCount;
+  }
+
+  MangaItem toMetadataOnly() {
+    return MangaItem(
+      id: id,
+      title: title,
+      fileName: fileName,
+      author: author,
+      format: format,
+      seriesOverride: seriesOverride,
+      coverBytes: coverBytes,
+      pages: const <MangaPage>[],
+      pageCount: pageCount,
+      lastPage: lastPage,
+    );
+  }
+
+  Map<String, dynamic> toMetadataMap() {
+    return {
+      'id': id,
+      'title': title,
+      'fileName': fileName,
+      'author': author,
+      'format': format,
+      'seriesOverride': seriesOverride,
+      'coverBytes': coverBytes,
+      'lastPage': lastPage,
+      'pageCount': pageCount,
+    };
   }
 
   Map<String, dynamic> toMap() {
@@ -162,8 +233,10 @@ class MangaItem {
       'fileName': fileName,
       'author': author,
       'format': format,
+      'seriesOverride': seriesOverride,
       'coverBytes': coverBytes,
       'lastPage': lastPage,
+      'pageCount': pageCount,
       'pages': pages.map((page) => page.toMap()).toList(),
     };
   }
@@ -181,6 +254,11 @@ class MangaItem {
       }
     }
 
+    final int pageCount =
+        map['pageCount'] is num
+            ? (map['pageCount'] as num).toInt()
+            : pages.length;
+
     int lastPage = -1;
 
     final dynamic rawLastPage = map['lastPage'];
@@ -191,8 +269,8 @@ class MangaItem {
       lastPage = rawLastPage.toInt();
     }
 
-    if (pages.isNotEmpty && lastPage >= pages.length) {
-      lastPage = pages.length - 1;
+    if (pageCount > 0 && lastPage >= pageCount) {
+      lastPage = pageCount - 1;
     }
 
     return MangaItem(
@@ -201,8 +279,50 @@ class MangaItem {
       fileName: map['fileName']?.toString() ?? '',
       author: map['author']?.toString() ?? '',
       format: map['format']?.toString() ?? 'CBZ',
+      seriesOverride:
+          map['seriesOverride']?.toString() ?? '',
       coverBytes: bytesFromDynamic(map['coverBytes']),
       pages: pages,
+      pageCount: pageCount,
+      lastPage: lastPage,
+    );
+  }
+
+  factory MangaItem.fromMetadataMap(
+    Map<dynamic, dynamic> map,
+  ) {
+    final int pageCount =
+        map['pageCount'] is num
+            ? (map['pageCount'] as num).toInt()
+            : map['pages'] is List
+                ? (map['pages'] as List).length
+                : 0;
+
+    int lastPage = -1;
+
+    final dynamic rawLastPage = map['lastPage'];
+
+    if (rawLastPage is int) {
+      lastPage = rawLastPage;
+    } else if (rawLastPage is num) {
+      lastPage = rawLastPage.toInt();
+    }
+
+    if (pageCount > 0 && lastPage >= pageCount) {
+      lastPage = pageCount - 1;
+    }
+
+    return MangaItem(
+      id: map['id']?.toString() ?? '',
+      title: map['title']?.toString() ?? 'Mangá',
+      fileName: map['fileName']?.toString() ?? '',
+      author: map['author']?.toString() ?? '',
+      format: map['format']?.toString() ?? 'CBZ',
+      seriesOverride:
+          map['seriesOverride']?.toString() ?? '',
+      coverBytes: bytesFromDynamic(map['coverBytes']),
+      pages: const <MangaPage>[],
+      pageCount: pageCount,
       lastPage: lastPage,
     );
   }
@@ -236,6 +356,122 @@ Uint8List bytesFromDynamic(dynamic value) {
   }
 
   return Uint8List(0);
+}
+
+String titleFromFileName(String fileName) {
+  String title = fileName;
+
+  title = title.replaceAll(
+    RegExp(
+      r'\.(cbz|zip|epub)$',
+      caseSensitive: false,
+    ),
+    '',
+  );
+
+  title = title.replaceAll('_', ' ');
+  title = title.replaceAll('-', ' ');
+
+  title = title.replaceAll(
+    RegExp(r'\s+'),
+    ' ',
+  );
+
+  return title.trim();
+}
+
+class MangaParseRequest {
+  final String fileName;
+  final Uint8List bytes;
+  final int fileCounter;
+
+  const MangaParseRequest({
+    required this.fileName,
+    required this.bytes,
+    required this.fileCounter,
+  });
+}
+
+// Função top-level (obrigatório para o compute()) que descompacta o
+// CBZ/ZIP/EPUB e monta as páginas. Isso roda numa isolate separada,
+// então a descompactação de arquivos grandes não trava a UI —
+// especialmente importante em Android mais fraco, onde fazer isso
+// na thread principal travava a tela durante a importação.
+MangaItem? parseMangaFromBytes(MangaParseRequest request) {
+  final String fileName = request.fileName;
+  final Uint8List bytes = request.bytes;
+  final int fileCounter = request.fileCounter;
+
+  final String extension =
+      fileName.contains('.')
+          ? fileName.split('.').last.toLowerCase()
+          : '';
+
+  if (!['epub', 'cbz', 'zip'].contains(extension)) {
+    return null;
+  }
+
+  final Archive archive = ZipDecoder().decodeBytes(bytes);
+
+  if (extension == 'epub') {
+    final EpubData epub = parseEpub(
+      archive,
+      titleFromFileName(fileName),
+    );
+
+    return MangaItem(
+      id:
+          '${DateTime.now().microsecondsSinceEpoch}-$fileCounter-$fileName',
+      title: epub.title,
+      fileName: fileName,
+      author: epub.author,
+      format: 'EPUB',
+      coverBytes: epub.cover,
+      pages: epub.pages,
+    );
+  }
+
+  final List<MangaPage> extractedPages = [];
+
+  for (final ArchiveFile archiveFile in archive) {
+    if (!archiveFile.isFile || !isImageFile(archiveFile.name)) {
+      continue;
+    }
+
+    final Uint8List imageBytes = archiveFileBytes(archiveFile);
+
+    if (imageBytes.isEmpty) {
+      continue;
+    }
+
+    extractedPages.add(
+      MangaPage(
+        name: archiveFile.name,
+        bytes: imageBytes,
+      ),
+    );
+  }
+
+  extractedPages.sort(
+    (a, b) => naturalCompareStatic(
+      a.name.toLowerCase(),
+      b.name.toLowerCase(),
+    ),
+  );
+
+  if (extractedPages.isEmpty) {
+    return null;
+  }
+
+  return MangaItem(
+    id:
+        '${DateTime.now().microsecondsSinceEpoch}-$fileCounter-$fileName',
+    title: titleFromFileName(fileName),
+    fileName: fileName,
+    format: extension == 'cbz' ? 'CBZ' : 'ZIP',
+    coverBytes: extractedPages.first.bytes,
+    pages: extractedPages,
+  );
 }
 
 Uint8List archiveFileBytes(ArchiveFile file) {
@@ -307,17 +543,7 @@ String? regexValue(
 }
 
 String seriesTitleFromTitle(String title) {
-  String result = title.replaceAll(
-    RegExp(
-      r'\s*Vol\.?\s*\d+.*$',
-      caseSensitive: false,
-    ),
-    '',
-  );
-
-  result = result.trim();
-
-  return result.isEmpty ? title : result;
+  return normalizedSeriesName(title);
 }
 
 EpubData parseEpub(
@@ -670,19 +896,57 @@ class SeriesGroup {
         return volume.author.trim();
       }
     }
+
     return '';
   }
 
+  bool get isChapterSeries =>
+      volumes.any(
+        (item) => chapterNumber(item.title) > 0,
+      );
+
+  String get itemSingular =>
+      isChapterSeries ? 'capítulo' : 'volume';
+
+  String get itemPlural =>
+      isChapterSeries ? 'capítulos' : 'volumes';
+
+  String get itemHeading =>
+      isChapterSeries ? 'Capítulos' : 'Volumes';
+
+  String get badgeLabel =>
+      isChapterSeries ? 'Caps.' : 'Volumes';
+
+  String get itemCountLabel =>
+      '${volumes.length} '
+      '${volumes.length == 1 ? itemSingular : itemPlural}';
+
+  String get totalPagesLabel =>
+      '${formatInteger(totalPages)} páginas';
+
+  String get completedLabel =>
+      '$finishedVolumes de ${volumes.length} '
+      '${volumes.length == 1 ? itemSingular : itemPlural} concluídos';
+
   int get totalPages =>
-      volumes.fold(0, (sum, volume) => sum + volume.pages.length);
+      volumes.fold(
+        0,
+        (sum, volume) =>
+            sum + volume.pageCount,
+      );
 
   int get startedVolumes =>
-      volumes.where((volume) => volume.hasStarted).length;
+      volumes.where(
+        (volume) => volume.hasStarted,
+      ).length;
 
   int get finishedVolumes =>
-      volumes.where((volume) => volume.isFinished).length;
+      volumes.where(
+        (volume) => volume.isFinished,
+      ).length;
 
-  bool get hasProgress => startedVolumes > 0;
+  bool get hasProgress =>
+      startedVolumes > 0;
 
   double get progress {
     if (volumes.isEmpty) {
@@ -695,14 +959,18 @@ class SeriesGroup {
       sum += volume.progress;
     }
 
-    return (sum / volumes.length).clamp(0.0, 1.0);
+    return (sum / volumes.length)
+        .clamp(0.0, 1.0);
   }
 
   MangaItem get fallbackCoverVolume {
     final sorted = [...volumes]
       ..sort(
-        (a, b) => volumeNumber(b.title)
-            .compareTo(volumeNumber(a.title)),
+        (a, b) =>
+            readingItemNumber(b)
+                .compareTo(
+              readingItemNumber(a),
+            ),
       );
 
     return sorted.first;
@@ -717,8 +985,11 @@ class SeriesGroup {
         )
         .toList()
       ..sort(
-        (a, b) => volumeNumber(a.title)
-            .compareTo(volumeNumber(b.title)),
+        (a, b) =>
+            readingItemNumber(a)
+                .compareTo(
+              readingItemNumber(b),
+            ),
       );
 
     if (started.isNotEmpty) {
@@ -726,11 +997,17 @@ class SeriesGroup {
     }
 
     final unread = volumes
-        .where((volume) => !volume.hasStarted)
+        .where(
+          (volume) =>
+              !volume.hasStarted,
+        )
         .toList()
       ..sort(
-        (a, b) => volumeNumber(a.title)
-            .compareTo(volumeNumber(b.title)),
+        (a, b) =>
+            readingItemNumber(a)
+                .compareTo(
+              readingItemNumber(b),
+            ),
       );
 
     if (unread.isNotEmpty) {
@@ -739,11 +1016,16 @@ class SeriesGroup {
 
     final sorted = [...volumes]
       ..sort(
-        (a, b) => volumeNumber(b.title)
-            .compareTo(volumeNumber(a.title)),
+        (a, b) =>
+            readingItemNumber(b)
+                .compareTo(
+              readingItemNumber(a),
+            ),
       );
 
-    return sorted.isEmpty ? null : sorted.first;
+    return sorted.isEmpty
+        ? null
+        : sorted.first;
   }
 }
 
@@ -757,34 +1039,227 @@ int volumeNumber(String title) {
     return 0;
   }
 
-  return int.tryParse(match.group(1) ?? '') ?? 0;
+  return int.tryParse(
+        match.group(1) ?? '',
+      ) ??
+      0;
 }
 
-String normalizedSeriesName(String title) {
-  var name = title.replaceAll(
+double chapterNumber(String title) {
+  final List<RegExp> patterns = [
     RegExp(
-      r'\s*[-–—]?\s*vol(?:ume)?\.?\s*\d+.*$',
+      r'(?:cap(?:[íi]tulo)?|chapter|ch)\.?\s*#?\s*(\d+(?:[.,]\d+)?)',
+      caseSensitive: false,
+    ),
+    RegExp(
+      r'#\s*(\d+(?:[.,]\d+)?)',
+      caseSensitive: false,
+    ),
+    // Ex.: "Blue Lock - 413"
+    RegExp(
+      r'[-–—]\s*(\d+(?:[.,]\d+)?)\s*$',
+      caseSensitive: false,
+    ),
+  ];
+
+  for (final pattern in patterns) {
+    final Match? match =
+        pattern.firstMatch(title);
+
+    if (match == null) {
+      continue;
+    }
+
+    final String raw =
+        (match.group(1) ?? '')
+            .replaceAll(',', '.');
+
+    final double? value =
+        double.tryParse(raw);
+
+    if (value != null) {
+      return value;
+    }
+  }
+
+  return 0;
+}
+
+bool isChapterTitle(String title) =>
+    chapterNumber(title) > 0 &&
+    volumeNumber(title) == 0;
+
+double readingItemNumber(
+  MangaItem manga,
+) {
+  final int volume =
+      volumeNumber(manga.title);
+
+  if (volume > 0) {
+    return volume.toDouble();
+  }
+
+  final double chapter =
+      chapterNumber(manga.title);
+
+  if (chapter > 0) {
+    return chapter;
+  }
+
+  return 0;
+}
+
+String _stripSeriesItemSuffix(
+  String value,
+) {
+  String name = value.trim();
+
+  // Remove extensão quando o fallback veio do nome do arquivo.
+  name = name.replaceFirst(
+    RegExp(
+      r'\.(cbz|zip|epub)$',
       caseSensitive: false,
     ),
     '',
   );
 
-  name = name.replaceAll(
-    RegExp(r'\s+'),
-    ' ',
+  // Volumes.
+  name = name.replaceFirst(
+    RegExp(
+      r'\s*[-–—:]?\s*vol(?:ume)?\.?\s*\d+(?:[.,]\d+)?(?:\s.*)?$',
+      caseSensitive: false,
+    ),
+    '',
   );
 
-  return name.trim().isEmpty ? title.trim() : name.trim();
+  // Capítulo / Cap / Chapter / Ch.
+  name = name.replaceFirst(
+    RegExp(
+      r'\s*[-–—:]?\s*(?:cap(?:[íi]tulo)?|chapter|ch)\.?\s*#?\s*\d+(?:[.,]\d+)?(?:\s.*)?$',
+      caseSensitive: false,
+    ),
+    '',
+  );
+
+  // "#413" no fim.
+  name = name.replaceFirst(
+    RegExp(
+      r'\s*[-–—:]?\s*#\s*\d+(?:[.,]\d+)?(?:\s.*)?$',
+      caseSensitive: false,
+    ),
+    '',
+  );
+
+  // Downloads que chegam como "Blue Lock - 413".
+  name = name.replaceFirst(
+    RegExp(
+      r'\s*[-–—]\s*\d+(?:[.,]\d+)?\s*$',
+      caseSensitive: false,
+    ),
+    '',
+  );
+
+  name = name
+      .replaceAll('_', ' ')
+      .replaceAll(
+        RegExp(r'\s+'),
+        ' ',
+      )
+      .trim();
+
+  return name;
+}
+
+bool _looksLikeOnlyChapterTitle(
+  String value,
+) {
+  return RegExp(
+    r'^\s*(?:cap(?:[íi]tulo)?|chapter|ch)\.?\s*#?\s*\d+(?:[.,]\d+)?\s*$',
+    caseSensitive: false,
+  ).hasMatch(value);
+}
+
+String normalizedSeriesName(
+  String title, {
+  String? fileName,
+}) {
+  String name =
+      _stripSeriesItemSuffix(title);
+
+  // Alguns EPUBs usam apenas "Capítulo 413" no metadata.
+  // Nesse caso recuperamos o nome da obra pelo arquivo importado.
+  if ((name.isEmpty ||
+          _looksLikeOnlyChapterTitle(
+            title,
+          ) ||
+          name == title.trim()) &&
+      fileName != null &&
+      fileName.trim().isNotEmpty) {
+    final String fileBased =
+        _stripSeriesItemSuffix(
+      fileName,
+    );
+
+    if (fileBased.isNotEmpty &&
+        !_looksLikeOnlyChapterTitle(
+          fileBased,
+        )) {
+      name = fileBased;
+    }
+  }
+
+  return name.trim().isEmpty
+      ? title.trim()
+      : name.trim();
 }
 
 String volumeLabel(MangaItem manga) {
-  final number = volumeNumber(manga.title);
+  final int volume =
+      volumeNumber(manga.title);
 
-  if (number > 0) {
-    return 'Vol. $number';
+  if (volume > 0) {
+    return 'Vol. $volume';
+  }
+
+  final double chapter =
+      chapterNumber(manga.title);
+
+  if (chapter > 0) {
+    final String number =
+        chapter == chapter.roundToDouble()
+            ? chapter.toInt().toString()
+            : chapter
+                .toString()
+                .replaceAll('.', ',');
+
+    return 'Cap. $number';
   }
 
   return manga.title;
+}
+
+String _seriesKey(String value) {
+  return value
+      .toLowerCase()
+      .replaceAll(
+        RegExp(r'[^a-z0-9]+'),
+        '',
+      );
+}
+
+Future<Uint8List?> _readCustomSeriesCover(
+  String seriesName,
+) {
+  final String cacheKey =
+      _seriesKey(seriesName);
+
+  return _customSeriesCoverCache.putIfAbsent(
+    cacheKey,
+    () => readSeriesCoverBytes(
+      windowsSeriesCoverFolder,
+      seriesName,
+    ),
+  );
 }
 
 String formatInteger(int value) {
@@ -802,37 +1277,59 @@ String formatInteger(int value) {
   return buffer.toString();
 }
 
-const String haikyuuSeriesCoverUrl =
-    'https://m.media-amazon.com/images/I/814zeD6s4HS.jpg';
-
 Widget seriesCoverImage(
   SeriesGroup series, {
   BoxFit fit = BoxFit.cover,
 }) {
-  final lower = series.name.toLowerCase();
-
-  if (lower.contains('haikyu')) {
-    return Image.network(
-      haikyuuSeriesCoverUrl,
+  Widget fallback() {
+    return Image.memory(
+      series.fallbackCoverVolume.cover,
       fit: fit,
-      errorBuilder: (
-        context,
-        error,
-        stackTrace,
-      ) {
-        return Image.memory(
-          series.fallbackCoverVolume.cover,
-          fit: fit,
-          gaplessPlayback: true,
-        );
-      },
+      gaplessPlayback: true,
+      filterQuality: FilterQuality.low,
+      cacheWidth: 900,
     );
   }
 
-  return Image.memory(
-    series.fallbackCoverVolume.cover,
-    fit: fit,
-    gaplessPlayback: true,
+  if (kIsWeb ||
+      defaultTargetPlatform !=
+          TargetPlatform.windows) {
+    return fallback();
+  }
+
+  return FutureBuilder<Uint8List?>(
+    future:
+        _readCustomSeriesCover(
+      series.name,
+    ),
+    builder: (
+      context,
+      snapshot,
+    ) {
+      final Uint8List? bytes =
+          snapshot.data;
+
+      if (bytes == null ||
+          bytes.isEmpty) {
+        return fallback();
+      }
+
+      return Image.memory(
+        bytes,
+        fit: fit,
+        gaplessPlayback: true,
+        filterQuality:
+            FilterQuality.medium,
+        cacheWidth: 900,
+        errorBuilder: (
+          context,
+          error,
+          stackTrace,
+        ) {
+          return fallback();
+        },
+      );
+    },
   );
 }
 
@@ -867,6 +1364,7 @@ class _LibraryScreenState
   bool loading = true;
   String? errorMessage;
   String searchQuery = '';
+  bool mobileSearchOpen = false;
 
   LibrarySection section =
       LibrarySection.library;
@@ -877,19 +1375,329 @@ class _LibraryScreenState
   // true  = Vol. 45 -> Vol. 1
   bool volumesDescending = false;
 
-  Box get libraryBox =>
-      Hive.box(libraryBoxName);
+  LazyBox? _libraryBox;
+  Box? _metadataBox;
+  Future<LazyBox>? _contentBoxFuture;
+  bool _storageInitializationStarted = false;
+  bool _contentWarmUpScheduled = false;
+
+  String? _cachedVolumeId;
+  MangaItem? _cachedVolume;
+
+  Box get metadataBox {
+    final Box? box = _metadataBox;
+
+    if (box == null) {
+      throw StateError(
+        'O armazenamento ainda não foi inicializado.',
+      );
+    }
+
+    return box;
+  }
 
   @override
   void initState() {
     super.initState();
-    loadLibrary();
+
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) {
+        _initializeStorage();
+      },
+    );
+  }
+
+  Future<void> _initializeStorage() async {
+    if (_storageInitializationStarted) {
+      return;
+    }
+
+    _storageInitializationStarted = true;
+
+    try {
+      await Hive.initFlutter();
+
+      // Esta box guarda somente dados leves da biblioteca.
+      // Ela abre muito mais rápido do que a box com todas as páginas.
+      _metadataBox =
+          await Hive.openBox(metadataBoxName);
+
+      if (metadataBox.isEmpty) {
+        await _migrateLegacyMetadata();
+      }
+
+      _loadLibraryFromMetadata();
+
+      // Só configura a integração Android depois que a biblioteca
+      // já está pronta para uso.
+      unawaited(
+        _configureAndroidFileOpen(),
+      );
+
+      // Mantém o startup rápido, mas prepara a box pesada logo
+      // depois. Assim as funções não ficam esperando a primeira
+      // abertura do armazenamento ao serem tocadas.
+      _scheduleContentWarmUp();
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        loading = false;
+        errorMessage =
+            'Erro ao inicializar biblioteca: $error';
+      });
+    }
+  }
+
+  void _scheduleContentWarmUp() {
+    if (_contentWarmUpScheduled) {
+      return;
+    }
+
+    _contentWarmUpScheduled = true;
+
+    // A box pesada é preparada imediatamente em segundo plano,
+    // sem atrasar a primeira pintura da biblioteca. Isso elimina
+    // a espera artificial de 500 ms que podia fazer o primeiro
+    // capítulo parecer lento ao ser aberto logo após o startup.
+    unawaited(
+      _ensureContentBox().then<void>(
+        (_) {},
+        onError: (_) {},
+      ),
+    );
+  }
+
+  Future<LazyBox> _ensureContentBox() {
+    final LazyBox? existing = _libraryBox;
+
+    if (existing != null && existing.isOpen) {
+      return Future<LazyBox>.value(existing);
+    }
+
+    final Future<LazyBox>? pending =
+        _contentBoxFuture;
+
+    if (pending != null) {
+      return pending;
+    }
+
+    final Future<LazyBox> future =
+        Hive.openLazyBox(libraryBoxName)
+            .then(
+      (LazyBox box) {
+        _libraryBox = box;
+        _contentBoxFuture = null;
+        return box;
+      },
+    );
+
+    _contentBoxFuture = future;
+    return future;
+  }
+
+  Future<void> _migrateLegacyMetadata() async {
+    final LazyBox contentBox =
+        await _ensureContentBox();
+
+    final List<dynamic> keys =
+        contentBox.keys.toList();
+
+    // A versão anterior já gravava __meta__ na box grande.
+    // Copiamos essas entradas pequenas para a nova box rápida.
+    final List<dynamic> metadataKeys =
+        keys.where(
+      (dynamic key) =>
+          key is String &&
+          key.startsWith('__meta__'),
+    ).toList();
+
+    if (metadataKeys.isNotEmpty) {
+      for (final dynamic key in metadataKeys) {
+        final dynamic value =
+            await contentBox.get(key);
+
+        if (value is! Map) {
+          continue;
+        }
+
+        final MangaItem manga =
+            MangaItem.fromMetadataMap(value);
+
+        final dynamic progress =
+            await contentBox.get(
+          progressKey(manga.id),
+        );
+
+        if (progress is num) {
+          manga.lastPage = progress
+              .toInt()
+              .clamp(
+                -1,
+                manga.pageCount <= 0
+                    ? -1
+                    : manga.pageCount - 1,
+              )
+              .toInt();
+        }
+
+        if (manga.id.isNotEmpty &&
+            manga.pageCount > 0) {
+          await metadataBox.put(
+            manga.id,
+            manga.toMetadataMap(),
+          );
+        }
+
+        await Future<void>.delayed(
+          Duration.zero,
+        );
+      }
+
+      return;
+    }
+
+    // Compatibilidade com bibliotecas da v1 original.
+    // É uma migração única; as próximas aberturas usam só metadataBox.
+    for (final dynamic key in keys) {
+      if (key is String &&
+          key.startsWith('__')) {
+        continue;
+      }
+
+      final dynamic value =
+          await contentBox.get(key);
+
+      if (value is! Map) {
+        continue;
+      }
+
+      final MangaItem manga =
+          MangaItem.fromMetadataMap(value);
+
+      if (manga.id.isEmpty ||
+          manga.pageCount <= 0) {
+        continue;
+      }
+
+      final dynamic progress =
+          await contentBox.get(
+        progressKey(manga.id),
+      );
+
+      if (progress is num) {
+        manga.lastPage = progress
+            .toInt()
+            .clamp(
+              -1,
+              manga.pageCount - 1,
+            )
+            .toInt();
+      }
+
+      await metadataBox.put(
+        manga.id,
+        manga.toMetadataMap(),
+      );
+
+      await Future<void>.delayed(
+        Duration.zero,
+      );
+    }
+  }
+
+  void _loadLibraryFromMetadata() {
+    final List<MangaItem> loaded = [];
+
+    for (final dynamic value
+        in metadataBox.values) {
+      if (value is! Map) {
+        continue;
+      }
+
+      final MangaItem manga =
+          MangaItem.fromMetadataMap(value);
+
+      if (manga.id.isNotEmpty &&
+          manga.pageCount > 0) {
+        loaded.add(manga);
+      }
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      library
+        ..clear()
+        ..addAll(loaded);
+
+      loading = false;
+      errorMessage = null;
+
+      final List<SeriesGroup> groups =
+          allSeries;
+
+      if (groups.isNotEmpty &&
+          selectedSeriesName == null) {
+        selectedSeriesName =
+            groups.first.name;
+      }
+    });
   }
 
   @override
   void dispose() {
+    if (!kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.android) {
+      androidFileChannel.setMethodCallHandler(null);
+    }
+
     searchController.dispose();
     super.dispose();
+  }
+
+  Future<void> _configureAndroidFileOpen() async {
+    if (kIsWeb ||
+        defaultTargetPlatform != TargetPlatform.android) {
+      return;
+    }
+
+    androidFileChannel.setMethodCallHandler(
+      (MethodCall call) async {
+        if (call.method != 'openFile') {
+          return;
+        }
+
+        final dynamic arguments = call.arguments;
+
+        if (arguments is Map) {
+          await _importAndroidOpenedFile(
+            Map<dynamic, dynamic>.from(arguments),
+          );
+        }
+      },
+    );
+
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) async {
+        try {
+          final Map<dynamic, dynamic>? initial =
+              await androidFileChannel.invokeMapMethod<
+                  dynamic, dynamic>('getInitialFile');
+
+          if (initial != null && mounted) {
+            await _importAndroidOpenedFile(initial);
+          }
+        } catch (_) {
+          // O canal existe apenas no Android. Falhas aqui não
+          // devem impedir a biblioteca de abrir normalmente.
+        }
+      },
+    );
   }
 
   List<SeriesGroup> get allSeries {
@@ -898,7 +1706,12 @@ class _LibraryScreenState
 
     for (final manga in library) {
       final String seriesName =
-          normalizedSeriesName(manga.title);
+          manga.seriesOverride.trim().isNotEmpty
+              ? manga.seriesOverride.trim()
+              : normalizedSeriesName(
+                  manga.title,
+                  fileName: manga.fileName,
+                );
 
       grouped.putIfAbsent(
         seriesName,
@@ -915,9 +1728,9 @@ class _LibraryScreenState
             volumes: entry.value
               ..sort(
                 (a, b) =>
-                    volumeNumber(a.title)
+                    readingItemNumber(a)
                         .compareTo(
-                  volumeNumber(b.title),
+                  readingItemNumber(b),
                 ),
               ),
           ),
@@ -982,52 +1795,33 @@ class _LibraryScreenState
     return null;
   }
 
-  void loadLibrary() {
-    try {
-      final List<MangaItem> loaded = [];
-
-      for (final dynamic value
-          in libraryBox.values) {
-        if (value is Map) {
-          final MangaItem manga =
-              MangaItem.fromMap(value);
-
-          if (manga.pages.isNotEmpty) {
-            loaded.add(manga);
-          }
-        }
-      }
-
-      setState(() {
-        library
-          ..clear()
-          ..addAll(loaded);
-
-        loading = false;
-
-        final groups = allSeries;
-
-        if (groups.isNotEmpty &&
-            selectedSeriesName == null) {
-          selectedSeriesName =
-              groups.first.name;
-        }
-      });
-    } catch (error) {
-      setState(() {
-        loading = false;
-        errorMessage =
-            'Erro ao carregar biblioteca: $error';
-      });
+  Future<void> loadLibrary() async {
+    if (_metadataBox == null) {
+      await _initializeStorage();
+      return;
     }
+
+    _loadLibraryFromMetadata();
   }
 
   Future<void> saveManga(
     MangaItem manga,
   ) async {
-    await libraryBox.put(
+    final LazyBox contentBox =
+        await _ensureContentBox();
+
+    // Só grava o conteúdo pesado (páginas) na box grande.
+    // Metadados (título, capa, progresso) já vivem só na
+    // metadataBox — gravá-los de novo aqui duplicava a escrita
+    // dos bytes da capa em disco a cada importação, à toa.
+    await contentBox.put(
       manga.id,
       manga.toMap(),
+    );
+
+    await metadataBox.put(
+      manga.id,
+      manga.toMetadataMap(),
     );
   }
 
@@ -1036,7 +1830,7 @@ class _LibraryScreenState
     int pageIndex,
   ) {
     if (pageIndex < 0 ||
-        pageIndex >= manga.pages.length) {
+        pageIndex >= manga.pageCount) {
       return;
     }
 
@@ -1046,171 +1840,548 @@ class _LibraryScreenState
 
     manga.lastPage = pageIndex;
 
-    saveManga(manga);
+    MangaItem metadataManga = manga;
+
+    for (final MangaItem item in library) {
+      if (item.id == manga.id) {
+        item.lastPage = pageIndex;
+        metadataManga = item;
+        break;
+      }
+    }
+
+    // Atualiza somente o registro leve. Não toca nas páginas
+    // durante a rolagem.
+    unawaited(
+      metadataBox.put(
+        metadataManga.id,
+        metadataManga.toMetadataMap(),
+      ),
+    );
+  }
+
+  Future<MangaItem?> _buildMangaFromBytes(
+    String fileName,
+    Uint8List bytes,
+    int fileCounter,
+  ) {
+    // compute() roda o parsing/descompactação numa isolate separada,
+    // então a UI continua fluida (60fps) enquanto um CBZ/ZIP grande
+    // é processado — antes isso rodava direto na thread principal
+    // e travava a tela em aparelhos mais fracos durante a importação.
+    return compute(
+      parseMangaFromBytes,
+      MangaParseRequest(
+        fileName: fileName,
+        bytes: bytes,
+        fileCounter: fileCounter,
+      ),
+    );
+  }
+
+  Future<MangaItem> _storeImportedManga(
+    MangaItem manga,
+  ) async {
+    await saveManga(manga);
+
+    // Guarda o volume recém-importado (já com as páginas em memória)
+    // no cache de leitura. Sem isso, ao tocar para ler logo após
+    // importar, o app reabria o Hive e descomprimia todas as
+    // páginas de novo — um trabalho redundante que fazia o
+    // primeiro capítulo demorar muito mais do que deveria.
+    _cachedVolumeId = manga.id;
+    _cachedVolume = manga;
+
+    return manga.toMetadataOnly();
+  }
+
+  Future<void> _importAndroidOpenedFile(
+    Map<dynamic, dynamic> data,
+  ) async {
+    final String path =
+        data['path']?.toString() ?? '';
+    final String name =
+        data['name']?.toString() ?? '';
+
+    if (path.isEmpty || name.isEmpty) {
+      return;
+    }
+
+    final dynamic lastHandledPath =
+        metadataBox.get(
+      androidLastOpenedPathKey,
+    );
+
+    // Evita reler automaticamente um Intent antigo quando
+    // o Android/Flutter reinicia a Activity.
+    if (lastHandledPath?.toString() == path) {
+      return;
+    }
+
+    // Marca ANTES da leitura. Se um arquivo inválido ou enorme
+    // derrubar a importação, a próxima abertura normal do app
+    // não ficará presa tentando o mesmo arquivo novamente.
+    await metadataBox.put(
+      androidLastOpenedPathKey,
+      path,
+    );
 
     if (mounted) {
-      setState(() {});
+      setState(() {
+        loading = true;
+        errorMessage = null;
+      });
+    }
+
+    try {
+      final Uint8List? bytes =
+          await readLocalFileBytes(path);
+
+      if (bytes == null) {
+        throw Exception(
+          'Não foi possível ler o arquivo selecionado.',
+        );
+      }
+
+      final MangaItem? manga =
+          await _buildMangaFromBytes(
+        name,
+        bytes,
+        1,
+      );
+
+      if (manga == null) {
+        throw Exception(
+          'O arquivo selecionado não é um EPUB, CBZ ou ZIP válido.',
+        );
+      }
+
+      MangaItem finalManga = manga;
+
+      if (_isAmbiguousChapterManga(
+        manga,
+      )) {
+        if (mounted) {
+          setState(() {
+            loading = false;
+          });
+        }
+
+        final String? seriesName =
+            await _askSeriesNameForChapters(
+          <MangaItem>[manga],
+        );
+
+        if (seriesName == null ||
+            seriesName.trim().isEmpty) {
+          return;
+        }
+
+        finalManga =
+            _withSeriesOverride(
+          manga,
+          seriesName,
+        );
+
+        if (mounted) {
+          setState(() {
+            loading = true;
+          });
+        }
+      }
+
+      final MangaItem lightweight =
+          await _storeImportedManga(
+        finalManga,
+      );
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        library.add(lightweight);
+        loading = false;
+        errorMessage = null;
+        selectedSeriesName =
+            lightweight.seriesOverride
+                    .trim()
+                    .isNotEmpty
+                ? lightweight
+                    .seriesOverride
+                    .trim()
+                : normalizedSeriesName(
+                    lightweight.title,
+                    fileName:
+                        lightweight.fileName,
+                  );
+      });
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        loading = false;
+        errorMessage =
+            'Não foi possível abrir o arquivo: $error';
+      });
     }
   }
 
+  bool _isAmbiguousChapterManga(
+    MangaItem manga,
+  ) {
+    if (!isChapterTitle(manga.title)) {
+      return false;
+    }
+
+    final String derived =
+        normalizedSeriesName(
+      manga.title,
+      fileName: manga.fileName,
+    ).trim();
+
+    return derived.isEmpty ||
+        _looksLikeOnlyChapterTitle(
+          derived,
+        ) ||
+        _looksLikeOnlyChapterTitle(
+          manga.title,
+        );
+  }
+
+  Future<String?> _askSeriesNameForChapters(
+    List<MangaItem> ambiguous,
+  ) async {
+    if (!mounted ||
+        ambiguous.isEmpty) {
+      return null;
+    }
+
+    final TextEditingController
+        controller =
+        TextEditingController();
+
+    String? result;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (
+        BuildContext dialogContext,
+      ) {
+        return AlertDialog(
+          title: const Text(
+            'Organizar capítulos',
+          ),
+          content: SizedBox(
+            width: 430,
+            child: Column(
+              mainAxisSize:
+                  MainAxisSize.min,
+              crossAxisAlignment:
+                  CrossAxisAlignment.start,
+              children: [
+                Text(
+                  ambiguous.length == 1
+                      ? 'Este EPUB contém um capítulo sem o nome da obra.'
+                      : 'Os ${ambiguous.length} EPUBs selecionados contêm capítulos sem o nome da obra.',
+                ),
+                const SizedBox(
+                  height: 8,
+                ),
+                const Text(
+                  'Digite o nome da obra uma única vez. Todos esses capítulos serão agrupados nela.',
+                  style: TextStyle(
+                    color:
+                        Colors.white70,
+                  ),
+                ),
+                const SizedBox(
+                  height: 16,
+                ),
+                TextField(
+                  controller:
+                      controller,
+                  autofocus: true,
+                  textInputAction:
+                      TextInputAction.done,
+                  decoration:
+                      const InputDecoration(
+                    labelText:
+                        'Nome da obra',
+                    hintText:
+                        'Ex.: Blue Lock',
+                    border:
+                        OutlineInputBorder(),
+                  ),
+                  onSubmitted: (
+                    value,
+                  ) {
+                    final String name =
+                        value.trim();
+
+                    if (name.isEmpty) {
+                      return;
+                    }
+
+                    result = name;
+                    Navigator.of(
+                      dialogContext,
+                    ).pop();
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                result = null;
+                Navigator.of(
+                  dialogContext,
+                ).pop();
+              },
+              child: const Text(
+                'Cancelar',
+              ),
+            ),
+            FilledButton(
+              onPressed: () {
+                final String name =
+                    controller.text.trim();
+
+                if (name.isEmpty) {
+                  return;
+                }
+
+                result = name;
+                Navigator.of(
+                  dialogContext,
+                ).pop();
+              },
+              child: const Text(
+                'Agrupar',
+              ),
+            ),
+          ],
+        );
+      },
+    );
+
+    controller.dispose();
+    return result;
+  }
+
+  MangaItem _withSeriesOverride(
+    MangaItem manga,
+    String seriesName,
+  ) {
+    return MangaItem(
+      id: manga.id,
+      title: manga.title,
+      fileName: manga.fileName,
+      author: manga.author,
+      format: manga.format,
+      seriesOverride:
+          seriesName.trim(),
+      coverBytes:
+          manga.coverBytes,
+      pages: manga.pages,
+      pageCount:
+          manga.pageCount,
+      lastPage:
+          manga.lastPage,
+    );
+  }
+
   Future<void> importManga() async {
-    setState(() {
-      loading = true;
-      errorMessage = null;
-    });
+    if (mounted) {
+      setState(() {
+        loading = true;
+        errorMessage = null;
+      });
+    }
 
     try {
       final FilePickerResult? result =
-          await FilePicker.pickFiles(
+          await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: [
           'cbz',
           'zip',
           'epub',
         ],
-        withData: true,
+        withData: kIsWeb,
         allowMultiple: true,
       );
 
       if (result == null) {
-        setState(() {
-          loading = false;
-        });
+        if (mounted) {
+          setState(() {
+            loading = false;
+          });
+        }
 
         return;
       }
 
-      final List<MangaItem>
-          importedMangas = [];
+      final List<MangaItem> parsedMangas =
+          [];
 
       int fileCounter = 0;
 
       for (final file in result.files) {
         fileCounter++;
 
-        if (file.bytes == null) {
+        Uint8List? bytes =
+            file.bytes;
+
+        if (bytes == null &&
+            file.path != null &&
+            file.path!.isNotEmpty) {
+          bytes =
+              await readLocalFileBytes(
+            file.path!,
+          );
+        }
+
+        if (bytes == null) {
           continue;
         }
 
-        final String extension =
-            file.extension
-                    ?.toLowerCase() ??
-                '';
-
-        final Archive archive =
-            ZipDecoder().decodeBytes(
-          file.bytes!,
+        final MangaItem? manga =
+            await _buildMangaFromBytes(
+          file.name,
+          bytes,
+          fileCounter,
         );
 
-        late MangaItem manga;
-
-        if (extension == 'epub') {
-          final EpubData epub =
-              parseEpub(
-            archive,
-            titleFromFileName(
-              file.name,
-            ),
-          );
-
-          manga = MangaItem(
-            id:
-                '${DateTime.now().microsecondsSinceEpoch}-$fileCounter-${file.name}',
-            title: epub.title,
-            fileName: file.name,
-            author: epub.author,
-            format: 'EPUB',
-            coverBytes: epub.cover,
-            pages: epub.pages,
-          );
-        } else {
-          final List<MangaPage>
-              extractedPages = [];
-
-          for (final ArchiveFile archiveFile
-              in archive) {
-            if (!archiveFile.isFile) {
-              continue;
-            }
-
-            if (!isImageFile(
-              archiveFile.name,
-            )) {
-              continue;
-            }
-
-            final Uint8List imageBytes =
-                archiveFileBytes(
-              archiveFile,
-            );
-
-            if (imageBytes.isEmpty) {
-              continue;
-            }
-
-            extractedPages.add(
-              MangaPage(
-                name: archiveFile.name,
-                bytes: imageBytes,
-              ),
-            );
-          }
-
-          extractedPages.sort(
-            (a, b) =>
-                naturalCompareStatic(
-              a.name.toLowerCase(),
-              b.name.toLowerCase(),
-            ),
-          );
-
-          if (extractedPages.isEmpty) {
-            continue;
-          }
-
-          manga = MangaItem(
-            id:
-                '${DateTime.now().microsecondsSinceEpoch}-$fileCounter-${file.name}',
-            title: titleFromFileName(
-              file.name,
-            ),
-            fileName: file.name,
-            format: extension == 'cbz'
-                ? 'CBZ'
-                : 'ZIP',
-            coverBytes:
-                extractedPages.first.bytes,
-            pages: extractedPages,
+        if (manga != null) {
+          parsedMangas.add(
+            manga,
           );
         }
 
-        await saveManga(manga);
+        bytes = null;
 
-        importedMangas.add(manga);
+        await Future<void>.delayed(
+          Duration.zero,
+        );
       }
 
-      if (importedMangas.isEmpty) {
+      if (parsedMangas.isEmpty) {
         throw Exception(
           'Nenhum mangá válido foi encontrado.',
         );
       }
 
+      final List<MangaItem> ambiguous =
+          parsedMangas
+              .where(
+                _isAmbiguousChapterManga,
+              )
+              .toList();
+
+      String? chapterSeriesName;
+
+      if (ambiguous.isNotEmpty) {
+        if (mounted) {
+          setState(() {
+            loading = false;
+          });
+        }
+
+        chapterSeriesName =
+            await _askSeriesNameForChapters(
+          ambiguous,
+        );
+
+        if (chapterSeriesName == null ||
+            chapterSeriesName.trim().isEmpty) {
+          return;
+        }
+
+        if (mounted) {
+          setState(() {
+            loading = true;
+          });
+        }
+      }
+
+      final Set<String> ambiguousIds =
+          ambiguous
+              .map(
+                (item) => item.id,
+              )
+              .toSet();
+
+      final List<MangaItem>
+          lightweightMangas =
+          [];
+
+      for (final MangaItem parsed
+          in parsedMangas) {
+        final MangaItem manga =
+            ambiguousIds.contains(
+                      parsed.id,
+                    ) &&
+                    chapterSeriesName !=
+                        null
+                ? _withSeriesOverride(
+                    parsed,
+                    chapterSeriesName,
+                  )
+                : parsed;
+
+        final MangaItem lightweight =
+            await _storeImportedManga(
+          manga,
+        );
+
+        lightweightMangas.add(
+          lightweight,
+        );
+
+        await Future<void>.delayed(
+          Duration.zero,
+        );
+      }
+
+      if (!mounted) {
+        return;
+      }
+
       setState(() {
         library.addAll(
-          importedMangas,
+          lightweightMangas,
         );
 
         loading = false;
+        errorMessage = null;
 
-        final String firstSeries =
-            normalizedSeriesName(
-          importedMangas.first.title,
-        );
+        final MangaItem first =
+            lightweightMangas.first;
 
         selectedSeriesName =
-            firstSeries;
+            first.seriesOverride
+                    .trim()
+                    .isNotEmpty
+                ? first
+                    .seriesOverride
+                    .trim()
+                : normalizedSeriesName(
+                    first.title,
+                    fileName:
+                        first.fileName,
+                  );
       });
     } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
       setState(() {
         loading = false;
         errorMessage =
@@ -1219,52 +2390,165 @@ class _LibraryScreenState
     }
   }
 
-  String titleFromFileName(
-    String fileName,
+  Future<MangaItem> _loadVolumeForReading(
+    MangaItem metadataManga,
+  ) async {
+    final MangaItem? cached =
+        _cachedVolume;
+
+    if (_cachedVolumeId ==
+            metadataManga.id &&
+        cached != null &&
+        cached.pages.isNotEmpty) {
+      cached.lastPage =
+          metadataManga.lastPage;
+      return cached;
+    }
+
+    final LazyBox contentBox =
+        await _ensureContentBox();
+
+    final dynamic raw =
+        await contentBox.get(
+      metadataManga.id,
+    );
+
+    if (raw is! Map) {
+      throw Exception(
+        'Os dados deste volume não foram encontrados.',
+      );
+    }
+
+    final MangaItem loadedManga =
+        MangaItem.fromMap(raw);
+
+    loadedManga.lastPage =
+        metadataManga.lastPage;
+
+    if (loadedManga.pages.isEmpty) {
+      throw Exception(
+        'Nenhuma página foi encontrada neste volume.',
+      );
+    }
+
+    _cachedVolumeId =
+        metadataManga.id;
+    _cachedVolume =
+        loadedManga;
+
+    return loadedManga;
+  }
+
+  List<MangaItem> _navigationItemsFor(
+    MangaItem manga,
   ) {
-    String title = fileName;
+    for (final SeriesGroup series in allSeries) {
+      if (series.volumes.any(
+        (item) => item.id == manga.id,
+      )) {
+        final List<MangaItem> items =
+            [...series.volumes];
 
-    title = title.replaceAll(
-      RegExp(
-        r'\.(cbz|zip|epub)$',
-        caseSensitive: false,
+        items.sort(
+          (a, b) => readingItemNumber(a)
+              .compareTo(readingItemNumber(b)),
+        );
+
+        return items;
+      }
+    }
+
+    return <MangaItem>[manga];
+  }
+
+  Future<void> openAdjacentVolume(
+    MangaItem manga,
+  ) async {
+    if (!mounted) {
+      return;
+    }
+
+    final List<MangaItem> navigationItems =
+        _navigationItemsFor(manga);
+
+    await Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) =>
+            _VolumeOpeningScreen(
+          title: manga.title,
+          loadVolume: () =>
+              _loadVolumeForReading(
+            manga,
+          ),
+          navigationItems:
+              navigationItems,
+          onOpenAdjacent:
+              openAdjacentVolume,
+          openDirectly: true,
+          onProgressChanged: (
+            MangaItem loadedManga,
+            int pageIndex,
+          ) {
+            updateProgress(
+              loadedManga,
+              pageIndex,
+            );
+
+            manga.lastPage =
+                pageIndex;
+          },
+        ),
       ),
-      '',
     );
-
-    title =
-        title.replaceAll('_', ' ');
-
-    title =
-        title.replaceAll('-', ' ');
-
-    title = title.replaceAll(
-      RegExp(r'\s+'),
-      ' ',
-    );
-
-    return title.trim();
   }
 
   Future<void> openVolume(
     MangaItem manga,
   ) async {
+    if (!mounted) {
+      return;
+    }
+
+    final List<MangaItem> navigationItems =
+        _navigationItemsFor(manga);
+
     await Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) =>
-            MangaDetailsScreen(
-          manga: manga,
+            _VolumeOpeningScreen(
+          title: manga.title,
+          loadVolume: () =>
+              _loadVolumeForReading(
+            manga,
+          ),
+          navigationItems:
+              navigationItems,
+          onOpenAdjacent:
+              openAdjacentVolume,
           onProgressChanged: (
+            MangaItem loadedManga,
             int pageIndex,
           ) {
             updateProgress(
-              manga,
+              loadedManga,
               pageIndex,
             );
+
+            manga.lastPage =
+                pageIndex;
           },
         ),
       ),
     );
+
+    if (!kIsWeb &&
+        defaultTargetPlatform ==
+            TargetPlatform.android) {
+      PaintingBinding.instance.imageCache
+          .clearLiveImages();
+      PaintingBinding.instance.imageCache
+          .clear();
+    }
 
     if (mounted) {
       setState(() {});
@@ -1287,9 +2571,27 @@ class _LibraryScreenState
   Future<void> removeManga(
     MangaItem manga,
   ) async {
-    await libraryBox.delete(
+    final LazyBox contentBox =
+        await _ensureContentBox();
+
+    await contentBox.delete(
       manga.id,
     );
+    await contentBox.delete(
+      progressKey(manga.id),
+    );
+    await contentBox.delete(
+      metadataKey(manga.id),
+    );
+
+    await metadataBox.delete(
+      manga.id,
+    );
+
+    if (_cachedVolumeId == manga.id) {
+      _cachedVolumeId = null;
+      _cachedVolume = null;
+    }
 
     setState(() {
       library.removeWhere(
@@ -1316,7 +2618,20 @@ class _LibraryScreenState
   ) async {
     for (final volume
         in series.volumes) {
-      await libraryBox.delete(
+      final LazyBox contentBox =
+          await _ensureContentBox();
+
+      await contentBox.delete(
+        volume.id,
+      );
+      await contentBox.delete(
+        progressKey(volume.id),
+      );
+      await contentBox.delete(
+        metadataKey(volume.id),
+      );
+
+      await metadataBox.delete(
         volume.id,
       );
     }
@@ -1325,6 +2640,12 @@ class _LibraryScreenState
       final ids = series.volumes
           .map((volume) => volume.id)
           .toSet();
+
+      if (_cachedVolumeId != null &&
+          ids.contains(_cachedVolumeId)) {
+        _cachedVolumeId = null;
+        _cachedVolume = null;
+      }
 
       library.removeWhere(
         (volume) =>
@@ -1339,7 +2660,14 @@ class _LibraryScreenState
   }
 
   Future<void> clearLibrary() async {
-    await libraryBox.clear();
+    final LazyBox contentBox =
+        await _ensureContentBox();
+
+    await contentBox.clear();
+    await metadataBox.clear();
+
+    _cachedVolumeId = null;
+    _cachedVolume = null;
 
     setState(() {
       library.clear();
@@ -1356,8 +2684,11 @@ class _LibraryScreenState
         BuildContext dialogContext,
       ) {
         return AlertDialog(
-          title:
-              const Text('Remover volume?'),
+          title: Text(
+            isChapterTitle(manga.title)
+                ? 'Remover capítulo?'
+                : 'Remover volume?',
+          ),
           content: Text(
             'Deseja remover "${manga.title}" da biblioteca?',
           ),
@@ -1402,7 +2733,7 @@ class _LibraryScreenState
           title:
               const Text('Remover série?'),
           content: Text(
-            'Isso removerá os ${series.volumes.length} volumes de "${series.name}" da biblioteca.',
+            'Isso removerá ${series.itemCountLabel} de "${series.name}" da biblioteca.',
           ),
           actions: [
             TextButton(
@@ -1528,7 +2859,13 @@ class _LibraryScreenState
                               1050;
 
                       if (!wide) {
-                        return _buildMobile();
+                        return Stack(
+                          children: [
+                            _buildMobile(),
+                            if (mobileSearchOpen)
+                              _buildMobileSearchOverlay(),
+                          ],
+                        );
                       }
 
                       return _buildDesktop();
@@ -1697,6 +3034,312 @@ class _LibraryScreenState
     );
   }
 
+  void _openMobileSearch() {
+    setState(() {
+      mobileSearchOpen = true;
+    });
+  }
+
+  void _closeMobileSearch() {
+    searchController.clear();
+
+    setState(() {
+      searchQuery = '';
+      mobileSearchOpen = false;
+    });
+  }
+
+  Widget _buildMobileSearchOverlay() {
+    final String query =
+        searchQuery.trim().toLowerCase();
+
+    final List<SeriesGroup> results =
+        query.isEmpty
+            ? <SeriesGroup>[]
+            : allSeries.where(
+                (series) {
+                  final String searchable =
+                      [
+                    series.name,
+                    ...series.volumes.map(
+                      (volume) =>
+                          '${volume.title} ${volume.author}',
+                    ),
+                  ].join(' ').toLowerCase();
+
+                  return searchable.contains(query);
+                },
+              ).toList();
+
+    return Positioned.fill(
+      child: Material(
+        color: Colors.black.withValues(
+          alpha: 0.58,
+        ),
+        child: SafeArea(
+          bottom: false,
+          child: GestureDetector(
+            behavior:
+                HitTestBehavior.opaque,
+            onTap: _closeMobileSearch,
+            child: Align(
+              alignment:
+                  Alignment.topCenter,
+              child: GestureDetector(
+                onTap: () {},
+                child: Container(
+                  margin:
+                      const EdgeInsets.fromLTRB(
+                    12,
+                    8,
+                    12,
+                    0,
+                  ),
+                  constraints:
+                      const BoxConstraints(
+                    maxWidth: 620,
+                    maxHeight: 430,
+                  ),
+                  decoration:
+                      BoxDecoration(
+                    color:
+                        Theme.of(context)
+                            .colorScheme
+                            .surface,
+                    borderRadius:
+                        BorderRadius.circular(
+                      16,
+                    ),
+                    border: Border.all(
+                      color:
+                          Theme.of(context)
+                              .dividerColor,
+                    ),
+                    boxShadow: const [
+                      BoxShadow(
+                        blurRadius: 24,
+                        spreadRadius: 2,
+                        color:
+                            Color(0x66000000),
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize:
+                        MainAxisSize.min,
+                    children: [
+                      Padding(
+                        padding:
+                            const EdgeInsets.all(
+                          10,
+                        ),
+                        child: TextField(
+                          controller:
+                              searchController,
+                          autofocus: true,
+                          textInputAction:
+                              TextInputAction.search,
+                          onChanged: (value) {
+                            setState(() {
+                              searchQuery =
+                                  value;
+                            });
+                          },
+                          decoration:
+                              InputDecoration(
+                            hintText:
+                                'Buscar título ou autor...',
+                            prefixIcon:
+                                const Icon(
+                              Icons.search,
+                            ),
+                            suffixIcon:
+                                IconButton(
+                              tooltip: 'Fechar',
+                              onPressed:
+                                  _closeMobileSearch,
+                              icon:
+                                  const Icon(
+                                Icons.close,
+                              ),
+                            ),
+                            filled: true,
+                            fillColor:
+                                Theme.of(context)
+                                    .colorScheme
+                                    .surfaceContainerHighest,
+                            border:
+                                OutlineInputBorder(
+                              borderRadius:
+                                  BorderRadius.circular(
+                                12,
+                              ),
+                              borderSide:
+                                  BorderSide.none,
+                            ),
+                          ),
+                        ),
+                      ),
+                      if (query.isEmpty)
+                        const Padding(
+                          padding:
+                              EdgeInsets.fromLTRB(
+                            18,
+                            6,
+                            18,
+                            20,
+                          ),
+                          child: Align(
+                            alignment:
+                                Alignment.centerLeft,
+                            child: Text(
+                              'Digite para pesquisar na sua biblioteca.',
+                              style: TextStyle(
+                                color:
+                                    Colors.white54,
+                              ),
+                            ),
+                          ),
+                        )
+                      else if (results.isEmpty)
+                        const Padding(
+                          padding:
+                              EdgeInsets.fromLTRB(
+                            18,
+                            8,
+                            18,
+                            22,
+                          ),
+                          child: Row(
+                            children: [
+                              Icon(
+                                Icons.search_off,
+                                color:
+                                    Colors.white54,
+                              ),
+                              SizedBox(
+                                width: 10,
+                              ),
+                              Text(
+                                'Nenhum título encontrado',
+                              ),
+                            ],
+                          ),
+                        )
+                      else
+                        Flexible(
+                          child:
+                              ListView.separated(
+                            padding:
+                                const EdgeInsets.fromLTRB(
+                              10,
+                              2,
+                              10,
+                              12,
+                            ),
+                            shrinkWrap: true,
+                            itemCount:
+                                results.length,
+                            separatorBuilder: (_, _) =>
+                                    const Divider(
+                              height: 1,
+                            ),
+                            itemBuilder:
+                                (context, index) {
+                              final SeriesGroup
+                                  series =
+                                  results[index];
+
+                              return ListTile(
+                                contentPadding:
+                                    const EdgeInsets.symmetric(
+                                  horizontal: 8,
+                                  vertical: 4,
+                                ),
+                                leading:
+                                    ClipRRect(
+                                  borderRadius:
+                                      BorderRadius.circular(
+                                    6,
+                                  ),
+                                  child: SizedBox(
+                                    width: 44,
+                                    height: 58,
+                                    child:
+                                        seriesCoverImage(
+                                      series,
+                                    ),
+                                  ),
+                                ),
+                                title: Text(
+                                  series.name,
+                                  maxLines: 1,
+                                  overflow:
+                                      TextOverflow.ellipsis,
+                                  style:
+                                      const TextStyle(
+                                    fontWeight:
+                                        FontWeight.w700,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  series.itemCountLabel,
+                                ),
+                                trailing:
+                                    const Icon(
+                                  Icons.chevron_right,
+                                ),
+                                onTap: () {
+                                  searchController
+                                      .clear();
+
+                                  setState(() {
+                                    searchQuery = '';
+                                    mobileSearchOpen =
+                                        false;
+                                    selectedSeriesName =
+                                        series.name;
+                                    section =
+                                        LibrarySection
+                                            .library;
+                                  });
+
+                                  Navigator.of(
+                                    context,
+                                  ).push(
+                                    MaterialPageRoute(
+                                      builder: (_) =>
+                                          SeriesMobileScreen(
+                                        series:
+                                            series,
+                                        onOpenVolume:
+                                            openVolume,
+                                        onContinue:
+                                            () =>
+                                                continueSeries(
+                                          series,
+                                        ),
+                                        onDeleteVolume:
+                                            showDeleteVolumeDialog,
+                                      ),
+                                    ),
+                                  );
+                                },
+                              );
+                            },
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildMobile() {
     if (section ==
         LibrarySection.settings) {
@@ -1719,6 +3362,8 @@ class _LibraryScreenState
                 importManga,
             onMore:
                 showClearLibraryDialog,
+            onSearchTap:
+                _openMobileSearch,
             compact: true,
           ),
           Expanded(
@@ -1747,6 +3392,8 @@ class _LibraryScreenState
               importManga,
           onMore:
               showClearLibraryDialog,
+          onSearchTap:
+              _openMobileSearch,
           compact: true,
         ),
         Padding(
@@ -2091,6 +3738,7 @@ class _TopBar extends StatelessWidget {
       onSearchChanged;
   final VoidCallback onImport;
   final VoidCallback onMore;
+  final VoidCallback? onSearchTap;
   final bool compact;
 
   const _TopBar({
@@ -2099,6 +3747,7 @@ class _TopBar extends StatelessWidget {
     required this.onSearchChanged,
     required this.onImport,
     required this.onMore,
+    this.onSearchTap,
     this.compact = false,
   });
 
@@ -2138,6 +3787,17 @@ class _TopBar extends StatelessWidget {
             width:
                 compact ? 14 : 34,
           ),
+          if (compact)
+            IconButton(
+              tooltip:
+                  'Pesquisar',
+              onPressed:
+                  onSearchTap,
+              icon: const Icon(
+                Icons.search,
+              ),
+            )
+          else
           Expanded(
             child: ConstrainedBox(
               constraints:
@@ -2200,18 +3860,27 @@ class _TopBar extends StatelessWidget {
             ),
           ),
           const Spacer(),
-          FilledButton.icon(
-            onPressed:
-                onImport,
-            icon: const Icon(
-              Icons.add,
+          if (compact)
+            IconButton.filled(
+              tooltip:
+                  'Importar',
+              onPressed:
+                  onImport,
+              icon: const Icon(
+                Icons.add,
+              ),
+            )
+          else
+            FilledButton.icon(
+              onPressed:
+                  onImport,
+              icon: const Icon(
+                Icons.add,
+              ),
+              label: const Text(
+                'Importar',
+              ),
             ),
-            label: Text(
-              compact
-                  ? 'Importar'
-                  : 'Importar',
-            ),
-          ),
           const SizedBox(
             width: 6,
           ),
@@ -2466,6 +4135,8 @@ class _SeriesLibraryCard
                           _CountBadge(
                         count:
                             series.volumes.length,
+                        label:
+                            series.badgeLabel,
                       ),
                     ),
                   ],
@@ -2576,7 +4247,7 @@ class _SeriesCardText
             height: 10,
           ),
           Text(
-            '${series.volumes.length} ${series.volumes.length == 1 ? 'volume' : 'volumes'}',
+            series.itemCountLabel,
             style:
                 TextStyle(
               color:
@@ -2614,9 +4285,11 @@ class _SeriesCardText
 class _CountBadge
     extends StatelessWidget {
   final int count;
+  final String label;
 
   const _CountBadge({
     required this.count,
+    required this.label,
   });
 
   @override
@@ -2652,7 +4325,7 @@ class _CountBadge
             ),
           ),
           Text(
-            'Volumes',
+            label,
             style: TextStyle(
               fontSize: 9,
               color:
@@ -2698,10 +4371,10 @@ class _SeriesDetailPane
         [...series.volumes]
           ..sort(
             (a, b) {
-              final int aNumber =
-                  volumeNumber(a.title);
-              final int bNumber =
-                  volumeNumber(b.title);
+              final double aNumber =
+                  readingItemNumber(a);
+              final double bNumber =
+                  readingItemNumber(b);
 
               return volumesDescending
                   ? bNumber.compareTo(aNumber)
@@ -2821,7 +4494,7 @@ class _SeriesDetailPane
                               icon: Icons
                                   .calendar_view_month_outlined,
                               text:
-                                  '${series.volumes.length} volumes',
+                                  series.itemCountLabel,
                             ),
                             _MetaInfo(
                               icon: Icons
@@ -2835,7 +4508,7 @@ class _SeriesDetailPane
                           height: 24,
                         ),
                         Text(
-                          'Coleção local de ${series.name}. Seus volumes importados ficam organizados aqui para leitura offline.',
+                          'Coleção local de ${series.name}. Seus ${series.itemPlural} importados ficam organizados aqui para leitura offline.',
                           style:
                               const TextStyle(
                             color:
@@ -2936,7 +4609,7 @@ class _SeriesDetailPane
                                 height: 10,
                               ),
                               Text(
-                                '${series.finishedVolumes} de ${series.volumes.length} volumes concluídos',
+                                series.completedLabel,
                                 style:
                                     const TextStyle(
                                   color:
@@ -2975,11 +4648,11 @@ class _SeriesDetailPane
               SliverToBoxAdapter(
             child: Row(
               children: [
-                const Expanded(
+                Expanded(
                   child: Text(
-                    'Volumes',
+                    series.itemHeading,
                     style:
-                        TextStyle(
+                        const TextStyle(
                       fontSize: 22,
                       fontWeight:
                           FontWeight.bold,
@@ -3242,13 +4915,16 @@ class _VolumeCard
                         }
                       },
                       itemBuilder:
-                          (context) =>
-                              const [
+                          (context) => [
                         PopupMenuItem(
                           value:
                               'delete',
                           child: Text(
-                            'Remover volume',
+                            isChapterTitle(
+                              manga.title,
+                            )
+                                ? 'Remover capítulo'
+                                : 'Remover volume',
                           ),
                         ),
                       ],
@@ -3503,7 +5179,7 @@ class _SeriesMobileScreenState
                     height: 12,
                   ),
                   Text(
-                    '${series.volumes.length} volumes • ${formatInteger(series.totalPages)} páginas',
+                    '${series.itemCountLabel} • ${series.totalPagesLabel}',
                     style:
                         const TextStyle(
                       color:
@@ -3535,10 +5211,10 @@ class _SeriesMobileScreenState
                   const SizedBox(
                     height: 24,
                   ),
-                  const Text(
-                    'Volumes',
+                  Text(
+                    series.itemHeading,
                     style:
-                        TextStyle(
+                        const TextStyle(
                       fontSize: 22,
                       fontWeight:
                           FontWeight.bold,
@@ -3596,7 +5272,7 @@ class _SeriesMobileScreenState
                       widget
                           .onDeleteVolume(
                     manga,
-                  ),
+                    ),
                 );
               },
             ),
@@ -3607,17 +5283,313 @@ class _SeriesMobileScreenState
   }
 }
 
+
+class _VolumeOpeningScreen
+    extends StatefulWidget {
+  final String title;
+  final Future<MangaItem> Function()
+      loadVolume;
+  final void Function(
+    MangaItem manga,
+    int pageIndex,
+  ) onProgressChanged;
+  final List<MangaItem> navigationItems;
+  final Future<void> Function(MangaItem manga)?
+      onOpenAdjacent;
+  final bool openDirectly;
+
+  const _VolumeOpeningScreen({
+    required this.title,
+    required this.loadVolume,
+    required this.onProgressChanged,
+    this.navigationItems = const <MangaItem>[],
+    this.onOpenAdjacent,
+    this.openDirectly = false,
+  });
+
+  @override
+  State<_VolumeOpeningScreen>
+      createState() =>
+          _VolumeOpeningScreenState();
+}
+
+class _VolumeOpeningScreenState
+    extends State<_VolumeOpeningScreen> {
+  MangaItem? manga;
+  Object? error;
+
+  @override
+  void initState() {
+    super.initState();
+
+    WidgetsBinding.instance.addPostFrameCallback(
+      (_) async {
+        // Dá tempo real para o Android desenhar a tela
+        // "Abrindo volume..." antes de iniciar a leitura pesada.
+        // Assim o usuário nunca fica preso visualmente na tela anterior.
+        // Esse delay só faz sentido no Android; nas outras
+        // plataformas ele só atrasava a abertura de todo capítulo
+        // sem necessidade.
+        if (!kIsWeb &&
+            defaultTargetPlatform == TargetPlatform.android) {
+          await Future<void>.delayed(
+            const Duration(milliseconds: 180),
+          );
+        }
+
+        if (!mounted) {
+          return;
+        }
+
+        await _load();
+      },
+    );
+  }
+
+  Future<void> _load() async {
+    try {
+      final MangaItem loaded =
+          await widget.loadVolume();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        manga = loaded;
+      });
+    } catch (loadError) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        error = loadError;
+      });
+    }
+  }
+
+  @override
+  Widget build(
+    BuildContext context,
+  ) {
+    final MangaItem? loaded =
+        manga;
+
+    if (loaded != null) {
+      // Volume novo: entra direto no leitor.
+      // A tela de detalhes/"Continuar leitura" só aparece
+      // para volumes que já possuem progresso salvo.
+      if (widget.openDirectly || !loaded.hasStarted) {
+        return ReaderScreen(
+          title: loaded.title,
+          seriesTitle:
+              normalizedSeriesName(
+            loaded.title,
+            fileName:
+                loaded.fileName,
+          ),
+          pages: loaded.pages,
+          initialPage:
+              loaded.hasStarted
+                  ? loaded.lastPage
+                  : 0,
+          previousItem:
+              _adjacentItem(
+            loaded,
+            widget.navigationItems,
+            -1,
+          ),
+          nextItem:
+              _adjacentItem(
+            loaded,
+            widget.navigationItems,
+            1,
+          ),
+          onOpenAdjacent:
+              widget.onOpenAdjacent,
+          onProgressChanged: (
+            int pageIndex,
+          ) {
+            widget.onProgressChanged(
+              loaded,
+              pageIndex,
+            );
+          },
+        );
+      }
+
+      return MangaDetailsScreen(
+        manga: loaded,
+        navigationItems:
+            widget.navigationItems,
+        onOpenAdjacent:
+            widget.onOpenAdjacent,
+        onProgressChanged: (
+          int pageIndex,
+        ) {
+          widget.onProgressChanged(
+            loaded,
+            pageIndex,
+          );
+        },
+      );
+    }
+
+    return Scaffold(
+      backgroundColor:
+          const Color(0xFF05060B),
+      appBar: AppBar(
+        backgroundColor:
+            const Color(0xFF090A10),
+        title: Text(
+          widget.title,
+          maxLines: 1,
+          overflow:
+              TextOverflow.ellipsis,
+        ),
+      ),
+      body: Center(
+        child: error != null
+            ? Padding(
+                padding:
+                    const EdgeInsets.all(
+                  24,
+                ),
+                child: Column(
+                  mainAxisSize:
+                      MainAxisSize.min,
+                  children: [
+                    const Icon(
+                      Icons.error_outline,
+                      size: 56,
+                    ),
+                    const SizedBox(
+                      height: 16,
+                    ),
+                    const Text(
+                      'Não foi possível abrir o volume.',
+                      textAlign:
+                          TextAlign.center,
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight:
+                            FontWeight.w700,
+                      ),
+                    ),
+                    const SizedBox(
+                      height: 8,
+                    ),
+                    Text(
+                      error.toString(),
+                      textAlign:
+                          TextAlign.center,
+                    ),
+                    const SizedBox(
+                      height: 18,
+                    ),
+                    FilledButton(
+                      onPressed: () {
+                        setState(() {
+                          error = null;
+                        });
+                        _load();
+                      },
+                      child: const Text(
+                        'Tentar novamente',
+                      ),
+                    ),
+                  ],
+                ),
+              )
+            : const Column(
+                mainAxisSize:
+                    MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 36,
+                    height: 36,
+                    child:
+                        CircularProgressIndicator(
+                      strokeWidth: 3,
+                    ),
+                  ),
+                  SizedBox(
+                    height: 18,
+                  ),
+                  Text(
+                    'Abrindo volume...',
+                    style: TextStyle(
+                      color:
+                          Colors.white70,
+                      fontSize: 15,
+                      fontWeight:
+                          FontWeight.w600,
+                    ),
+                  ),
+                  SizedBox(
+                    height: 6,
+                  ),
+                  Text(
+                    'Preparando páginas para leitura',
+                    style: TextStyle(
+                      color:
+                          Colors.white38,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+}
+
+// Esta tela é usada apenas para volumes que já foram iniciados.
+// Volumes ainda não lidos entram diretamente no ReaderScreen.
+MangaItem? _adjacentItem(
+  MangaItem current,
+  List<MangaItem> navigationItems,
+  int direction,
+) {
+  if (navigationItems.isEmpty) {
+    return null;
+  }
+
+  final int index = navigationItems.indexWhere(
+    (item) => item.id == current.id,
+  );
+
+  if (index < 0) {
+    return null;
+  }
+
+  final int targetIndex = index + direction;
+
+  if (targetIndex < 0 ||
+      targetIndex >= navigationItems.length) {
+    return null;
+  }
+
+  return navigationItems[targetIndex];
+}
+
 class MangaDetailsScreen
     extends StatefulWidget {
   final MangaItem manga;
 
   final ValueChanged<int>
       onProgressChanged;
+  final List<MangaItem> navigationItems;
+  final Future<void> Function(MangaItem manga)?
+      onOpenAdjacent;
 
   const MangaDetailsScreen({
     super.key,
     required this.manga,
     required this.onProgressChanged,
+    this.navigationItems = const <MangaItem>[],
+    this.onOpenAdjacent,
   });
 
   @override
@@ -3638,6 +5610,8 @@ class _MangaDetailsScreenState
           seriesTitle:
               normalizedSeriesName(
             widget.manga.title,
+            fileName:
+                widget.manga.fileName,
           ),
           pages:
               widget.manga.pages,
@@ -3646,6 +5620,20 @@ class _MangaDetailsScreenState
                   ? widget.manga
                       .lastPage
                   : 0,
+          previousItem:
+              _adjacentItem(
+            widget.manga,
+            widget.navigationItems,
+            -1,
+          ),
+          nextItem:
+              _adjacentItem(
+            widget.manga,
+            widget.navigationItems,
+            1,
+          ),
+          onOpenAdjacent:
+              widget.onOpenAdjacent,
           onProgressChanged: (
             int pageIndex,
           ) {
@@ -3653,8 +5641,6 @@ class _MangaDetailsScreenState
                 .onProgressChanged(
               pageIndex,
             );
-
-            setState(() {});
           },
         ),
       ),
@@ -3676,13 +5662,13 @@ class _MangaDetailsScreenState
 
     if (!manga.hasStarted) {
       statusText =
-          '${manga.pages.length} páginas';
+          '${manga.pageCount} páginas';
     } else if (manga.isFinished) {
       statusText =
           'Leitura concluída';
     } else {
       statusText =
-          'Página ${manga.lastPage + 1} de ${manga.pages.length}';
+          'Página ${manga.lastPage + 1} de ${manga.pageCount}';
     }
 
     return Scaffold(
@@ -3796,6 +5782,10 @@ class ReaderScreen
   final String seriesTitle;
   final List<MangaPage> pages;
   final int initialPage;
+  final MangaItem? previousItem;
+  final MangaItem? nextItem;
+  final Future<void> Function(MangaItem manga)?
+      onOpenAdjacent;
 
   final ValueChanged<int>
       onProgressChanged;
@@ -3806,6 +5796,9 @@ class ReaderScreen
     required this.seriesTitle,
     required this.pages,
     required this.initialPage,
+    this.previousItem,
+    this.nextItem,
+    this.onOpenAdjacent,
     required this.onProgressChanged,
   });
 
@@ -3834,6 +5827,8 @@ class _ReaderScreenState
 
   bool showInterface = true;
   bool isZoomed = false;
+  bool isFullscreen = false;
+  bool fullscreenAvailable = false;
 
   int currentPage = 0;
 
@@ -3853,6 +5848,14 @@ class _ReaderScreenState
       0,
       widget.pages.length - 1,
     );
+
+    fullscreenAvailable =
+        !kIsWeb &&
+        defaultTargetPlatform == TargetPlatform.windows;
+
+    if (fullscreenAvailable) {
+      _loadFullscreenState();
+    }
 
     itemPositionsListener
         .itemPositions
@@ -3877,6 +5880,60 @@ class _ReaderScreenState
         }
       },
     );
+  }
+
+  Future<void> _loadFullscreenState() async {
+    try {
+      final bool value =
+          await windowManager.isFullScreen();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        isFullscreen = value;
+      });
+    } catch (_) {
+      // O botão continua oculto se a API nativa não estiver disponível.
+    }
+  }
+
+  Future<void> toggleFullscreen() async {
+    if (!fullscreenAvailable || isZoomed) {
+      return;
+    }
+
+    try {
+      final bool target = !isFullscreen;
+      await windowManager.setFullScreen(target);
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        isFullscreen = target;
+        showInterface = true;
+      });
+    } catch (_) {
+      // Evita quebrar o leitor caso a janela nativa recuse a operação.
+    }
+  }
+
+  Future<void> handleEscapeFullscreen() async {
+    if (!fullscreenAvailable || !isFullscreen) {
+      return;
+    }
+
+    await windowManager.setFullScreen(false);
+
+    if (mounted) {
+      setState(() {
+        isFullscreen = false;
+        showInterface = true;
+      });
+    }
   }
 
   void handleZoomChanged() {
@@ -3953,7 +6010,7 @@ class _ReaderScreenState
 
     saveTimer = Timer(
       const Duration(
-        milliseconds: 180,
+        milliseconds: 350,
       ),
       () {
         widget.onProgressChanged(
@@ -3961,6 +6018,21 @@ class _ReaderScreenState
         );
       },
     );
+  }
+
+  Future<void> openAdjacent(MangaItem? target) async {
+    if (target == null ||
+        widget.onOpenAdjacent == null ||
+        isZoomed) {
+      return;
+    }
+
+    saveTimer?.cancel();
+    widget.onProgressChanged(
+      currentPage,
+    );
+
+    await widget.onOpenAdjacent!(target);
   }
 
   void toggleInterface() {
@@ -3994,14 +6066,52 @@ class _ReaderScreenState
           );
   }
 
-  void resetZoom() {
-    transformationController.value =
-        Matrix4.identity();
+  void handlePointerSignal(PointerSignalEvent event) {
+    if (!fullscreenAvailable &&
+        !kIsWeb &&
+        defaultTargetPlatform != TargetPlatform.windows) {
+      return;
+    }
+
+    if (event is! PointerScrollEvent) {
+      return;
+    }
+
+    // No PC, Ctrl + roda do mouse controla o zoom.
+    // A roda normal continua dedicada à leitura vertical.
+    if (!HardwareKeyboard.instance.isControlPressed) {
+      return;
+    }
+
+    if (!mounted) {
+      return;
+    }
+
+    if (event.scrollDelta.dy < 0) {
+      final double nextZoom =
+          (currentZoom + 0.25).clamp(1.0, 4.0);
+
+      transformationController.value =
+          Matrix4.identity()
+            ..scaleByDouble(
+              nextZoom,
+              nextZoom,
+              nextZoom,
+              1.0,
+            );
+    } else if (event.scrollDelta.dy > 0) {
+      transformationController.value =
+          Matrix4.identity();
+    }
   }
 
   @override
   void dispose() {
     saveTimer?.cancel();
+
+    if (fullscreenAvailable && isFullscreen) {
+      windowManager.setFullScreen(false);
+    }
 
     widget.onProgressChanged(
       currentPage,
@@ -4040,6 +6150,16 @@ class _ReaderScreenState
             ? desktopReaderWidth
             : screenWidth;
 
+    final double devicePixelRatio =
+        MediaQuery.devicePixelRatioOf(
+      context,
+    );
+
+    final int mobileDecodeWidth =
+        (readerWidth * devicePixelRatio)
+            .round()
+            .clamp(720, 1440);
+
     return Scaffold(
       backgroundColor:
           const Color(
@@ -4053,9 +6173,11 @@ class _ReaderScreenState
                 context,
                 constraints,
               ) {
-                return GestureDetector(
-                  behavior:
-                      HitTestBehavior.translucent,
+                return Listener(
+                  onPointerSignal: handlePointerSignal,
+                  child: GestureDetector(
+                    behavior:
+                        HitTestBehavior.translucent,
                   onTap:
                       toggleInterface,
                   onDoubleTap:
@@ -4064,9 +6186,9 @@ class _ReaderScreenState
                     transformationController:
                         transformationController,
 
-                    // No desktop o mouse wheel fica 100% dedicado
-                    // ao scroll vertical. O zoom é feito pelo
-                    // double click.
+                    // No desktop a roda normal continua dedicada
+                    // ao scroll vertical. Segurando Ctrl, a roda
+                    // controla o zoom da imagem.
                     //
                     // No celular/tablet continuamos permitindo
                     // pinch-to-zoom com dois dedos.
@@ -4107,7 +6229,12 @@ class _ReaderScreenState
                             EdgeInsets.zero,
                         physics: isZoomed
                             ? const NeverScrollableScrollPhysics()
-                            : const ClampingScrollPhysics(),
+                            : desktop
+                                ? const ClampingScrollPhysics()
+                                : const BouncingScrollPhysics(
+                                    parent:
+                                        AlwaysScrollableScrollPhysics(),
+                                  ),
                         itemBuilder: (
                           context,
                           index,
@@ -4115,34 +6242,110 @@ class _ReaderScreenState
                           final MangaPage page =
                               widget.pages[index];
 
-                          return SizedBox(
-                            width:
-                                constraints.maxWidth,
-                            child: Align(
-                              alignment:
-                                  Alignment.topCenter,
-                              child: SizedBox(
-                                width:
-                                    readerWidth,
-                                child:
-                                    Image.memory(
-                                  page.bytes,
+                          final Widget pageImage =
+                              RepaintBoundary(
+                            child: SizedBox(
+                              width:
+                                  constraints.maxWidth,
+                              child: Align(
+                                alignment:
+                                    Alignment.topCenter,
+                                child: SizedBox(
                                   width:
                                       readerWidth,
-                                  fit:
-                                      BoxFit.fitWidth,
-                                  gaplessPlayback:
-                                      true,
-                                  filterQuality:
-                                      FilterQuality.medium,
+                                  child:
+                                      Image.memory(
+                                    page.bytes,
+                                    width:
+                                        readerWidth,
+                                    fit:
+                                        BoxFit.fitWidth,
+                                    gaplessPlayback:
+                                        true,
+                                    filterQuality:
+                                        desktop
+                                            ? FilterQuality.medium
+                                            : FilterQuality.low,
+                                    cacheWidth:
+                                        desktop
+                                            ? null
+                                            : mobileDecodeWidth,
+                                  ),
                                 ),
                               ),
                             ),
+                          );
+
+                          if (index !=
+                                  widget.pages.length - 1 ||
+                              widget.nextItem == null) {
+                            return pageImage;
+                          }
+
+                          return Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              pageImage,
+                              const SizedBox(height: 28),
+                              Container(
+                                width: readerWidth,
+                                margin: const EdgeInsets.only(
+                                  bottom: 36,
+                                ),
+                                padding: const EdgeInsets.all(24),
+                                decoration: BoxDecoration(
+                                  color: const Color(0xFF10121A),
+                                  borderRadius: BorderRadius.circular(18),
+                                  border: Border.all(
+                                    color: const Color(0xFF292C38),
+                                  ),
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    const Text(
+                                      'Fim do capítulo',
+                                      style: TextStyle(
+                                        color: Colors.white70,
+                                        fontSize: 14,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 10),
+                                    Text(
+                                      widget.nextItem!.title,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      textAlign: TextAlign.center,
+                                      style: const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 18,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 16),
+                                    FilledButton.icon(
+                                      onPressed: isZoomed
+                                          ? null
+                                          : () => openAdjacent(
+                                                widget.nextItem,
+                                              ),
+                                      icon: const Icon(
+                                        Icons.arrow_forward_rounded,
+                                      ),
+                                      label: const Text(
+                                        'Próximo capítulo',
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ],
                           );
                         },
                       ),
                     ),
                   ),
+                ),
                 );
               },
             ),
@@ -4217,8 +6420,8 @@ class _ReaderScreenState
                     ),
                     Padding(
                       padding:
-                          const EdgeInsets.only(
-                        right: 6,
+                          const EdgeInsets.symmetric(
+                        horizontal: 8,
                       ),
                       child: Text(
                         '${currentPage + 1}/${widget.pages.length}',
@@ -4230,16 +6433,18 @@ class _ReaderScreenState
                         ),
                       ),
                     ),
-                    IconButton(
-                      tooltip:
-                          'Resetar zoom',
-                      onPressed:
-                          resetZoom,
-                      icon: const Icon(
-                        Icons
-                            .fit_screen,
+                    if (fullscreenAvailable)
+                      IconButton(
+                        tooltip: isFullscreen
+                            ? 'Sair da tela cheia'
+                            : 'Tela cheia',
+                        onPressed: toggleFullscreen,
+                        icon: Icon(
+                          isFullscreen
+                              ? Icons.fullscreen_exit
+                              : Icons.fullscreen,
+                        ),
                       ),
-                    ),
                   ],
                 ),
               ),
