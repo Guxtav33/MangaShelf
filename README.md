@@ -1,5 +1,9 @@
 # 📚 MangaShelf
 
+![CI](https://github.com/Guxtav33/MangaShelf/actions/workflows/ci.yml/badge.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)
+![Platforms](https://img.shields.io/badge/platform-Android%20%7C%20Windows-informational)
+
 **MangaShelf** é um leitor de mangás offline desenvolvido em **Flutter**, criado para organizar e ler arquivos de mangá armazenados localmente de forma simples e confortável.
 
 O projeto nasceu da ideia de ter uma biblioteca pessoal semelhante aos antigos leitores de mangá offline: você importa seus próprios arquivos, o MangaShelf organiza os volumes e mantém seu progresso de leitura.
@@ -107,3 +111,15 @@ Verifique a instalação:
 ```bash
 flutter doctor
 ```
+
+### Rodando os testes
+
+```bash
+flutter test
+```
+
+---
+
+## 📄 Licença
+
+Este projeto está sob a licença [MIT](LICENSE).
